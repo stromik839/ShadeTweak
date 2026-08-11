@@ -9,9 +9,15 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 
 /**
- * Знайдено статичним аналізом systemui.zip (HyperOS 2.0.210.0, Redmi Note 12S),
- * НЕ перевірено на реальному пристрої розробником. Якщо після встановлення
- * нічого не змінюється - дивись логи LSPosed Manager -> Logs, шукай "ShadeTweak".
+ * Знайдено статичним аналізом systemui.zip (HyperOS 2.0.210.0, Redmi Note 12S).
+ *
+ * З логів (2026-08-10) підтверджено: handleLoadPackage для com.android.systemui
+ * викликається LSPosed двічі - раз на головному потоці при старті процесу
+ * (клас знаходиться одразу), і вдруге секунд через 4-5 на іншому потоці
+ * (ClassNotFoundException) - ймовірно, окремий classloader Центру керування
+ * HyperOS, який у момент виклику ще не має класу в собі. Тому кожен хук
+ * реєструється з повтором: якщо клас не знайдено одразу, пробуємо ще раз
+ * із затримкою, поки classloader не довантажиться.
  */
 class MainHook : IXposedHookLoadPackage {
 
@@ -24,7 +30,35 @@ class MainHook : IXposedHookLoadPackage {
             "com.android.systemui.statusbar.phone.ScrimController"
         private const val OWN_PACKAGE = "com.shadetweak.hyperos"
         private const val PREFS_NAME = "shade_tweak_prefs"
-        private const val DEFAULT_ARGB = "40FFFFFF" // білий, прозорість ~25% за замовчуванням
+        private const val DEFAULT_ARGB = "40FFFFFF"
+        private const val RETRY_ATTEMPTS = 8
+        private const val RETRY_DELAY_MS = 1000L
+    }
+
+    // Пробує зареєструвати хук; якщо клас/метод ще не видно в цьому
+    // classloader - повторює з затримкою замість того, щоб здатися одразу.
+    private fun hookWithRetry(
+        label: String,
+        register: () -> Unit
+    ) {
+        Thread {
+            for (attempt in 1..RETRY_ATTEMPTS) {
+                try {
+                    register()
+                    XposedBridge.log("$TAG: $label заховано успішно (спроба $attempt)")
+                    return@Thread
+                } catch (t: Throwable) {
+                    if (attempt == RETRY_ATTEMPTS) {
+                        XposedBridge.log("$TAG: $label hook FAILED після $RETRY_ATTEMPTS спроб: $t")
+                    } else {
+                        try {
+                            Thread.sleep(RETRY_DELAY_MS)
+                        } catch (ignored: InterruptedException) {
+                        }
+                    }
+                }
+            }
+        }.start()
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
@@ -39,40 +73,22 @@ class MainHook : IXposedHookLoadPackage {
             param.thisObject ?: param.args.getOrNull(0)
 
         fun applyOverride(instance: Any?, caller: String) {
-            if (instance == null) {
-                XposedBridge.log("$TAG[$caller]: instance == null, пропускаю")
-                return
-            }
+            if (instance == null) return
             prefs.reload()
-            val enabled = prefs.getBoolean("enabled", true)
-            if (!enabled) {
-                XposedBridge.log("$TAG[$caller]: enabled=false, лишаю оригінал")
-                return
-            }
+            if (!prefs.getBoolean("enabled", true)) return
             val argbHex = prefs.getString("argb", DEFAULT_ARGB) ?: DEFAULT_ARGB
             val color = try {
                 Color.parseColor("#$argbHex")
             } catch (t: Throwable) {
-                XposedBridge.log("$TAG[$caller]: не зміг розпарсити '$argbHex', fallback на дефолт: $t")
                 Color.parseColor("#$DEFAULT_ARGB")
             }
             val alpha = Color.alpha(color)
             val rgb = color and 0x00FFFFFF
-            XposedBridge.log(
-                "$TAG[$caller]: прочитано argb=$argbHex -> alpha=$alpha rgb=${Integer.toHexString(rgb)}"
-            )
             try {
                 XposedHelpers.setIntField(instance, "solidAlpha", alpha)
                 XposedHelpers.setIntField(instance, "solidRGB", rgb)
-                // читаємо назад одразу, щоб підтвердити що значення реально збереглись
-                val readbackAlpha = XposedHelpers.getIntField(instance, "solidAlpha")
-                val readbackRgb = XposedHelpers.getIntField(instance, "solidRGB")
-                XposedBridge.log(
-                    "$TAG[$caller]: після setIntField readback alpha=$readbackAlpha " +
-                        "rgb=${Integer.toHexString(readbackRgb)}"
-                )
             } catch (t: Throwable) {
-                XposedBridge.log("$TAG[$caller]: setIntField/getIntField не спрацював: $t")
+                XposedBridge.log("$TAG[$caller]: setIntField не спрацював: $t")
             }
         }
 
@@ -84,20 +100,10 @@ class MainHook : IXposedHookLoadPackage {
                 applyOverride(targetOf(param), "updateWindow-after")
             }
         }
-
-        // Hook 1: спрацьовує щоразу, коли вікно шторки оновлюється й читає
-        // поточні solidAlpha/solidRGB - тут ми примусово підставляємо свої
-        // значення ПЕРЕД тим, як оригінальний код їх використає.
-        try {
+        hookWithRetry("updateWindow") {
             XposedHelpers.findAndHookMethod(TARGET_CLASS, classLoader, "updateWindow", hook)
-            XposedBridge.log("$TAG: updateWindow заховано успішно")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: updateWindow hook FAILED: $t")
         }
 
-        // Hook 2: спрацьовує, коли система перераховує кольори з ресурсів
-        // (наприклад, зміна теми/дня-ночі) - підставляємо свої значення ПІСЛЯ
-        // оригінального розрахунку, щоб не бути перезаписаними.
         val hook2 = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 applyOverride(targetOf(param), "updateResources-before")
@@ -106,24 +112,16 @@ class MainHook : IXposedHookLoadPackage {
                 applyOverride(targetOf(param), "updateResources-after")
             }
         }
-        try {
+        hookWithRetry("access\$updateResources") {
             XposedHelpers.findAndHookMethod(
                 TARGET_CLASS, classLoader,
                 "access\$updateResources", TARGET_CLASS,
                 hook2
             )
-            XposedBridge.log("$TAG: access\$updateResources заховано успішно")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: access\$updateResources hook FAILED: $t")
         }
 
         // === ФАЗА 2 (експериментально, вимкнено за замовчуванням) ===
-        // Окремий шар: стандартний AOSP ScrimController - затемнення позаду
-        // шторки, яке раніше було непомітне на тлі суцільного сірого. Цей
-        // клас використовується ТАКОЖ для екрана блокування/AOD/PIN, тому
-        // хук звужено тільки на стан UNLOCKED (шторка над розблокованим
-        // домашнім екраном) - інші стани не чіпаються.
-        try {
+        hookWithRetry("setScrimAlpha") {
             XposedHelpers.findAndHookMethod(
                 SCRIM_CONTROLLER_CLASS, classLoader,
                 "setScrimAlpha",
@@ -132,35 +130,19 @@ class MainHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         prefs.reload()
-                        val scrimEnabled = prefs.getBoolean("scrim_enabled", false)
-                        if (!scrimEnabled) {
-                            XposedBridge.log("$TAG[scrim]: scrim_enabled=false, пропускаю")
-                            return
-                        }
+                        if (!prefs.getBoolean("scrim_enabled", false)) return
                         try {
                             val state = XposedHelpers.getObjectField(param.thisObject, "mState")
                             val stateName = XposedHelpers.callMethod(state, "name") as? String
-                            val originalAlpha = param.args[1]
-                            XposedBridge.log(
-                                "$TAG[scrim]: setScrimAlpha викликано, state=$stateName " +
-                                    "originalAlpha=$originalAlpha"
-                            )
-                            if (stateName != "UNLOCKED") {
-                                XposedBridge.log("$TAG[scrim]: стан не UNLOCKED, лишаю оригінал")
-                                return
-                            }
+                            if (stateName != "UNLOCKED") return
                             val target = prefs.getFloat("scrim_alpha", 0.0f)
                             param.args[1] = target
-                            XposedBridge.log("$TAG[scrim]: підмінено на $target")
                         } catch (t: Throwable) {
                             XposedBridge.log("$TAG[scrim]: помилка: $t")
                         }
                     }
                 }
             )
-            XposedBridge.log("$TAG: setScrimAlpha заховано успішно")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: setScrimAlpha hook FAILED: $t")
         }
     }
 }
