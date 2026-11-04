@@ -18,6 +18,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # по умолчанию ставится пакет "tools", которого в репозитории SDK
+          # больше нет -> sdkmanager падает. Платформу и build-tools AGP
+          # докачает сам.
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
