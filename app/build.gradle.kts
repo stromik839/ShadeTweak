@@ -20,8 +20,13 @@ android {
         applicationId = "com.shadetweak.hyperos"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+    }
+
+    buildFeatures {
+        // BuildConfig.VERSION_NAME пишется в лог LSPosed и в статус
+        buildConfig = true
     }
 
     buildTypes {

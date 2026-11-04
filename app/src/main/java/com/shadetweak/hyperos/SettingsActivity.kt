@@ -2,269 +2,439 @@ package com.shadetweak.hyperos
 
 import android.app.Activity
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.Editable
+import android.text.InputFilter
+import android.text.TextWatcher
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
-import java.io.DataOutputStream
-import java.io.File
+import java.util.concurrent.Executors
 
 class SettingsActivity : Activity() {
 
     private val prefsName = "shade_tweak_prefs"
+    private lateinit var prefs: SharedPreferences
 
-    // Проста темна/світла палітра - без AppCompat/Material, щоб не тягнути
-    // зайві залежності в збірку. Слідує системному темному режиму телефону.
-    private class Palette(dark: Boolean) {
-        val background = if (dark) Color.parseColor("#121212") else Color.WHITE
-        val text = if (dark) Color.parseColor("#E1E1E1") else Color.parseColor("#1A1A1A")
-        val secondaryText = if (dark) Color.parseColor("#AAAAAA") else Color.parseColor("#555555")
-        val fieldBackground = if (dark) Color.parseColor("#2A2A2A") else Color.parseColor("#F0F0F0")
-        val buttonBackground = if (dark) Color.parseColor("#3A3A3A") else Color.parseColor("#E0E0E0")
-        val hint = if (dark) Color.parseColor("#777777") else Color.parseColor("#999999")
-    }
+    private val io = Executors.newSingleThreadExecutor()
+    private val main = Handler(Looper.getMainLooper())
 
-    private fun isDarkMode(): Boolean {
-        val mode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
-        return mode == Configuration.UI_MODE_NIGHT_YES
-    }
+    private var color = DEFAULT_COLOR
+    private var updatingViews = false
 
-    // Виконує "killall com.android.systemui" через root напряму з застосунку,
-    // без Termux. Перший запуск -> KernelSU спитає дозвіл root для цього apk.
-    private fun restartSystemUiAsRoot(onDone: (Boolean, String) -> Unit) {
-        Thread {
-            var ok = false
-            var msg = ""
-            try {
-                val process = Runtime.getRuntime().exec("su")
-                val os = DataOutputStream(process.outputStream)
-                os.writeBytes("killall com.android.systemui\n")
-                os.writeBytes("exit\n")
-                os.flush()
-                os.close()
-                val code = process.waitFor()
-                ok = code == 0
-                msg = if (ok) "SystemUI перезапущено" else "su завершився з кодом $code"
-            } catch (t: Throwable) {
-                msg = "root недоступний: ${t.message}"
-            }
-            runOnUiThread { onDone(ok, msg) }
-        }.start()
-    }
+    private lateinit var preview: ColorPreviewView
+    private lateinit var hexInput: EditText
+    private lateinit var colorInfo: TextView
+    private lateinit var statusText: TextView
+    private lateinit var resultText: TextView
+    private lateinit var enabledSwitch: Switch
+    private lateinit var forceSolidSwitch: Switch
+    private lateinit var modalSwitch: Switch
+    private val sliders = arrayOfNulls<SeekBar>(4)       // A, R, G, B
+    private val sliderLabels = arrayOfNulls<TextView>(4)
+
+    private val density by lazy { resources.displayMetrics.density }
+    private fun dp(v: Int) = (v * density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
-        val density = resources.displayMetrics.density
-        val pad = (16 * density).toInt()
-        val dark = isDarkMode()
-        val pal = Palette(dark)
+        prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+        color = loadColor()
+        setContentView(buildUi())
+        syncViewsFromColor(fromHex = false, fromSlider = false)
+    }
 
-        window.statusBarColor = pal.background
-        if (!dark) {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility =
-                window.decorView.systemUiVisibility or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        }
+    override fun onResume() {
+        super.onResume()
+        refreshStatus()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        io.shutdown()
+    }
+
+    // ------------------------------------------------------------------ UI
+
+    private fun buildUi(): View {
+        val dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            setBackgroundColor(pal.background)
+            setPadding(dp(16), dp(20), dp(16), dp(32))
         }
 
-        val header = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "Shade Tweak"
-            textSize = 22f
-            setTextColor(pal.text)
-            setPadding(0, 0, 0, pad)
-        }
-
-        val info = TextView(this).apply {
-            text = "Колір фону шторки (без блюру), формат AARRGGBB.\n\n" +
-                "AA — прозорість (00 = невидимо, FF = суцільно непрозоро)\n" +
-                "RRGGBB — сам колір\n\n" +
-                "Приклади:\n" +
-                "40FFFFFF — білий, прозорість ~25%\n" +
-                "992B2B2B — темно-сірий, прозорість ~60%\n" +
-                "FFFF0000 — суцільно червоний\n" +
-                "00FFFFFF — повністю прозоро"
-            textSize = 14f
-            setTextColor(pal.text)
-            setPadding(0, 0, 0, pad)
-        }
-
-        val input = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(prefs.getString("argb", "40FFFFFF"))
-            hint = "40FFFFFF"
-            setTextColor(pal.text)
-            setHintTextColor(pal.hint)
-            setBackgroundColor(pal.fieldBackground)
-            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
-        }
-
-        val preview = TextView(this).apply {
-            text = "Попередній перегляд"
-            gravity = Gravity.CENTER
-            setTextColor(pal.text)
-            setPadding(0, pad, 0, pad)
-            height = (80 * density).toInt()
-        }
-
-        fun refreshPreview() {
-            try {
-                preview.setBackgroundColor(Color.parseColor("#" + input.text.toString().trim()))
-            } catch (t: Throwable) {
-                preview.setBackgroundColor(Color.DKGRAY)
-            }
-        }
-        refreshPreview()
-
-        fun makeWorldReadable() {
-            try {
-                val dir = File(applicationInfo.dataDir, "shared_prefs")
-                dir.setReadable(true, false)
-                dir.setExecutable(true, false)
-                val f = File(dir, "$prefsName.xml")
-                if (f.exists()) f.setReadable(true, false)
-            } catch (t: Throwable) {
-                // ігноруємо - на деяких пристроях це не критично
-            }
-        }
-
-        val statusText = TextView(this).apply {
-            setTextColor(pal.secondaryText)
-            setPadding(0, pad, 0, 0)
-        }
-
-        val saveBtn = Button(this).apply {
-            text = "Зберегти й застосувати"
-            setTextColor(pal.text)
-            setBackgroundColor(pal.buttonBackground)
-        }
-        saveBtn.setOnClickListener {
-            val hex = input.text.toString().trim().uppercase().removePrefix("#")
-            try {
-                Color.parseColor("#$hex")
-                prefs.edit().putString("argb", hex).putBoolean("enabled", true).commit()
-                makeWorldReadable()
-                refreshPreview()
-                statusText.text = "Збережено ($hex). Перезапускаю SystemUI..."
-                restartSystemUiAsRoot { ok, msg ->
-                    statusText.text = "Збережено ($hex). $msg" +
-                        if (!ok) "\nВідкрий шторку вручну або виконай у Termux: " +
-                            "su -c \"killall com.android.systemui\"" else ""
-                }
-            } catch (t: Throwable) {
-                input.error = "Невірний формат, приклад: 40FFFFFF"
-                statusText.text = "Помилка формату кольору"
-            }
-        }
-
-        val toggleBtn = Button(this).apply {
-            text = if (prefs.getBoolean("enabled", true))
-                "Вимкнути заміну (лишити стандартний сірий)" else "Увімкнути заміну"
-            setTextColor(pal.text)
-            setBackgroundColor(pal.buttonBackground)
-        }
-        toggleBtn.setOnClickListener {
-            val cur = prefs.getBoolean("enabled", true)
-            prefs.edit().putBoolean("enabled", !cur).commit()
-            makeWorldReadable()
-            toggleBtn.text = if (!cur)
-                "Вимкнути заміну (лишити стандартний сірий)" else "Увімкнути заміну"
-            statusText.text = "Змінено. Перезапускаю SystemUI..."
-            restartSystemUiAsRoot { ok, msg -> statusText.text = "Змінено. $msg" }
-        }
-
-        makeWorldReadable()
-
-        val scrimDivider = TextView(this).apply {
-            text = "\n— Експериментально —"
-            setTextColor(pal.text)
-            setPadding(0, pad * 2, 0, pad)
-        }
-        val scrimInfo = TextView(this).apply {
-            text = "Додатковий шар затемнення (ScrimController), який лишався " +
-                "видимим навіть після налаштування вище. Впливає ТІЛЬКИ на " +
-                "шторку над розблокованим домашнім екраном - екран блокування, " +
-                "AOD і PIN не чіпає. Значення 0.0-1.0 (0 = зовсім не затемнювати)."
-            textSize = 14f
-            setTextColor(pal.text)
-            setPadding(0, 0, 0, pad)
-        }
-        val scrimInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText(prefs.getFloat("scrim_alpha", 0.0f).toString())
-            hint = "0.0"
-            setTextColor(pal.text)
-            setHintTextColor(pal.hint)
-            setBackgroundColor(pal.fieldBackground)
-            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
-        }
-        val scrimToggle = Button(this).apply {
-            text = if (prefs.getBoolean("scrim_enabled", false))
-                "Вимкнути експериментальний шар" else "Увімкнути експериментальний шар"
-            setTextColor(pal.text)
-            setBackgroundColor(pal.buttonBackground)
-        }
-        val scrimStatus = TextView(this).apply {
-            setTextColor(pal.secondaryText)
-            setPadding(0, pad, 0, 0)
-        }
-        scrimToggle.setOnClickListener {
-            val newAlpha = scrimInput.text.toString().trim().toFloatOrNull()
-            if (newAlpha == null || newAlpha < 0f || newAlpha > 1f) {
-                scrimInput.error = "Число від 0.0 до 1.0"
-                return@setOnClickListener
-            }
-            val curEnabled = prefs.getBoolean("scrim_enabled", false)
-            prefs.edit()
-                .putFloat("scrim_alpha", newAlpha)
-                .putBoolean("scrim_enabled", !curEnabled)
-                .commit()
-            makeWorldReadable()
-            scrimToggle.text = if (!curEnabled)
-                "Вимкнути експериментальний шар" else "Увімкнути експериментальний шар"
-            scrimStatus.text = "Змінено (${!curEnabled}, alpha=$newAlpha). Перезапускаю SystemUI..."
-            restartSystemUiAsRoot { ok, msg -> scrimStatus.text = "Змінено. $msg" }
-        }
-
-        val debugHint = TextView(this).apply {
-            text = "\nЯкщо щось не працює: LSPosed Manager -> Logs -> шукай \"ShadeTweak\"." +
-                "\nАвтоматичний перезапуск SystemUI потребує окремого дозволу root " +
-                "для цього застосунку (запит KernelSU при першому натисканні)."
-            textSize = 12f
-            setTextColor(pal.secondaryText)
-            setPadding(0, pad, 0, 0)
-        }
-
-        root.addView(header)
-        root.addView(info)
-        root.addView(input)
-        root.addView(saveBtn)
-        root.addView(toggleBtn)
-        root.addView(preview)
-        root.addView(statusText)
-
-        root.addView(scrimDivider)
-        root.addView(scrimInfo)
-        root.addView(scrimInput)
-        root.addView(scrimToggle)
-        root.addView(scrimStatus)
-        root.addView(debugHint)
-
-        setContentView(ScrollView(this).apply {
-            setBackgroundColor(pal.background)
-            addView(root)
+            textSize = 24f
+            setTypeface(typeface, Typeface.BOLD)
         })
+        root.addView(caption("Цвет и прозрачность фона шторки HyperOS, когда блюр выключен"))
+
+        statusText = TextView(this).apply {
+            textSize = 13f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(0x1F808080)
+            }
+            text = "Статус: проверяю…"
+        }
+        root.addView(statusText, matchWrap(top = dp(16)))
+
+        enabledSwitch = Switch(this).apply {
+            text = "Заменить фон шторки"
+            textSize = 16f
+            isChecked = prefs.getBoolean(P_ENABLED, false)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(P_ENABLED, checked).apply()
+                applyNow()
+            }
+        }
+        root.addView(enabledSwitch, matchWrap(top = dp(16)))
+
+        preview = ColorPreviewView(this, dark)
+        root.addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(140)).apply {
+            topMargin = dp(12)
+        })
+
+        colorInfo = caption("")
+        root.addView(colorInfo, matchWrap(top = dp(6)))
+
+        // --- HEX
+        val hexRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        hexInput = EditText(this).apply {
+            hint = "AARRGGBB"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            filters = arrayOf(InputFilter.LengthFilter(9))
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            typeface = Typeface.MONOSPACE
+            setSingleLine()
+            // живое превью при вводе; сохраняется по OK / Готово
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    if (updatingViews) return
+                    val parsed = Keys.parseColor(s?.toString()) ?: return
+                    color = parsed
+                    syncViewsFromColor(fromHex = true, fromSlider = false)
+                }
+            })
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_DONE) {
+                    applyHex()
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        hexRow.addView(hexInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        hexRow.addView(Button(this).apply {
+            text = "OK"
+            setOnClickListener { applyHex() }
+        })
+        root.addView(hexRow, matchWrap(top = dp(4)))
+
+        // --- слайдеры
+        for (i in 0 until 4) {
+            val label = TextView(this).apply { textSize = 13f }
+            sliderLabels[i] = label
+            root.addView(label, matchWrap(top = dp(if (i == 0) 12 else 6)))
+            val bar = SeekBar(this).apply {
+                max = 255
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                        if (!fromUser || updatingViews) return
+                        color = colorFromSliders()
+                        syncViewsFromColor(fromHex = false, fromSlider = true)
+                    }
+
+                    override fun onStartTrackingTouch(seekBar: SeekBar) {}
+
+                    override fun onStopTrackingTouch(seekBar: SeekBar) {
+                        saveColor()
+                        applyNow()
+                    }
+                })
+            }
+            sliders[i] = bar
+            root.addView(bar, matchWrap())
+        }
+
+        // --- готовые варианты
+        root.addView(header("Быстрый выбор"), matchWrap(top = dp(16)))
+        val presetsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((name, c) in PRESETS) {
+            presetsRow.addView(Button(this).apply {
+                text = name
+                isAllCaps = false
+                setOnClickListener {
+                    color = c
+                    syncViewsFromColor(fromHex = false, fromSlider = false)
+                    saveColor()
+                    if (!enabledSwitch.isChecked) {
+                        enabledSwitch.isChecked = true // сам вызовет applyNow()
+                    } else {
+                        applyNow()
+                    }
+                }
+            })
+        }
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(presetsRow)
+        }, matchWrap(top = dp(4)))
+
+        // --- дополнительные настройки
+        root.addView(header("Дополнительно"), matchWrap(top = dp(20)))
+        forceSolidSwitch = Switch(this).apply {
+            text = "Отключать скриншот-блюр"
+            isChecked = prefs.getBoolean(P_FORCE_SOLID, true)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(P_FORCE_SOLID, checked).apply()
+                applyNow(extra = "Чтобы это заработало, перезапусти SystemUI.")
+            }
+        }
+        root.addView(forceSolidSwitch, matchWrap(top = dp(4)))
+        root.addView(caption(
+            "На некоторых устройствах HyperOS вместо блюра рисует размытый скриншот " +
+                "с серым фильтром — в этом режиме свой цвет вообще не применяется. " +
+                "Переключатель возвращает обычный сплошной фон (нужен перезапуск SystemUI)."
+        ))
+
+        modalSwitch = Switch(this).apply {
+            text = "Тот же цвет для окна уведомления"
+            isChecked = prefs.getBoolean(P_MODAL, true)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(P_MODAL, checked).apply()
+                applyNow()
+            }
+        }
+        root.addView(modalSwitch, matchWrap(top = dp(12)))
+        root.addView(caption("Фон, который появляется за раскрытым уведомлением (долгое нажатие)."))
+
+        // --- кнопки
+        root.addView(Button(this).apply {
+            text = "Применить"
+            setOnClickListener {
+                saveColor()
+                applyNow()
+            }
+        }, matchWrap(top = dp(20)))
+        root.addView(Button(this).apply {
+            text = "Перезапустить SystemUI"
+            setOnClickListener { restartSystemUi() }
+        }, matchWrap(top = dp(4)))
+
+        resultText = caption("")
+        root.addView(resultText, matchWrap(top = dp(8)))
+
+        root.addView(caption(
+            "Цвет применяется сразу, без перезапуска. При первом сохранении KernelSU " +
+                "попросит root — он нужен один раз, чтобы выдать приложению право писать " +
+                "настройки (WRITE_SECURE_SETTINGS).\n\n" +
+                "Если не работает: LSPosed → Модули → Shade Tweak включён, в области " +
+                "отмечен «Системный интерфейс», затем перезапусти SystemUI. Логи: " +
+                "LSPosed → Логи → «ShadeTweak»."
+        ), matchWrap(top = dp(16)))
+
+        return ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        }
+    }
+
+    private fun caption(text: String) = TextView(this).apply {
+        this.text = text
+        textSize = 12f
+        alpha = 0.75f
+    }
+
+    private fun header(text: String) = TextView(this).apply {
+        this.text = text
+        textSize = 15f
+        setTypeface(typeface, Typeface.BOLD)
+    }
+
+    private fun matchWrap(top: Int = 0) =
+        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = top }
+
+    // ---------------------------------------------------------------- цвет
+
+    private fun colorFromSliders(): Int {
+        val v = IntArray(4) { sliders[it]?.progress ?: 0 }
+        return Color.argb(v[0], v[1], v[2], v[3])
+    }
+
+    private fun syncViewsFromColor(fromHex: Boolean, fromSlider: Boolean) {
+        updatingViews = true
+        try {
+            preview.color = color
+            val parts = intArrayOf(Color.alpha(color), Color.red(color), Color.green(color), Color.blue(color))
+            for (i in 0 until 4) {
+                if (!fromSlider) sliders[i]?.progress = parts[i]
+                sliderLabels[i]?.text = if (i == 0) {
+                    "${SLIDER_NAMES[i]}: ${percent(parts[0])}%" + when (parts[0]) {
+                        0 -> " (полностью прозрачно)"
+                        255 -> " (без прозрачности)"
+                        else -> ""
+                    }
+                } else {
+                    "${SLIDER_NAMES[i]}: ${parts[i]}"
+                }
+            }
+            if (!fromHex) hexInput.setText(Keys.formatColor(color))
+            colorInfo.text = "#${Keys.formatColor(color)} · непрозрачность ${percent(parts[0])}%"
+        } finally {
+            updatingViews = false
+        }
+    }
+
+    private fun percent(alpha: Int) = Math.round(alpha * 100f / 255f)
+
+    private fun applyHex() {
+        val parsed = Keys.parseColor(hexInput.text.toString())
+        if (parsed == null) {
+            hexInput.error = "Формат AARRGGBB, например 00000000 или 80000000"
+            return
+        }
+        color = parsed
+        syncViewsFromColor(fromHex = false, fromSlider = false)
+        saveColor()
+        if (!enabledSwitch.isChecked) enabledSwitch.isChecked = true else applyNow()
+    }
+
+    private fun loadColor(): Int {
+        if (prefs.contains(P_COLOR)) return prefs.getInt(P_COLOR, DEFAULT_COLOR)
+        // перенос со старой версии (строка AARRGGBB)
+        return Keys.parseColor(prefs.getString("argb", null)) ?: DEFAULT_COLOR
+    }
+
+    private fun saveColor() {
+        prefs.edit().putInt(P_COLOR, color).apply()
+    }
+
+    // ------------------------------------------------------------ применение
+
+    private fun applyNow(extra: String? = null) {
+        val values = linkedMapOf(
+            Keys.COLOR to Keys.formatColor(color),
+            Keys.FORCE_SOLID to if (forceSolidSwitch.isChecked) "1" else "0",
+            Keys.MODAL to if (modalSwitch.isChecked) "1" else "0",
+            // ENABLED последним: SystemUI перечитает всё по одному событию
+            Keys.ENABLED to if (enabledSwitch.isChecked) "1" else "0",
+        )
+        resultText.text = "Сохраняю…"
+        io.execute {
+            val res = SettingsStore.write(applicationContext, values)
+            main.post {
+                if (isFinishing) return@post
+                resultText.text = buildString {
+                    append(if (res.ok) "✓ " else "✗ ")
+                    append(res.message)
+                    if (res.ok && enabledSwitch.isChecked) append(". Открой шторку — цвет уже должен быть новым.")
+                    if (!res.ok) {
+                        append("\n\nБез root можно выдать право один раз через ПК:\n")
+                        append("adb shell pm grant $packageName android.permission.WRITE_SECURE_SETTINGS")
+                    }
+                    if (extra != null) append("\n").append(extra)
+                }
+                main.postDelayed({ refreshStatus() }, 800)
+            }
+        }
+    }
+
+    private fun restartSystemUi() {
+        resultText.text = "Перезапускаю SystemUI…"
+        io.execute {
+            val res = Root.restartSystemUi()
+            main.post {
+                if (isFinishing) return@post
+                resultText.text = if (res.ok) "✓ SystemUI перезапущен" else "✗ ${res.output}"
+                main.postDelayed({ refreshStatus() }, 5000)
+            }
+        }
+    }
+
+    private fun refreshStatus() {
+        io.execute {
+            val status = SettingsStore.readStatus(applicationContext)
+            val canRead = SettingsStore.hasPermission(applicationContext)
+            main.post {
+                if (!isFinishing) statusText.text = describeStatus(status, canRead)
+            }
+        }
+    }
+
+    private fun describeStatus(s: Map<String, String>?, canRead: Boolean): String {
+        if (s == null) {
+            return if (!canRead) {
+                "Статус: пока неизвестен. Нажми «Применить» — после выдачи разрешения здесь " +
+                    "появится, что модуль видит в SystemUI."
+            } else {
+                "Статус: SystemUI не отвечает. Проверь, что модуль включён в LSPosed " +
+                    "(область: «Системный интерфейс»), и перезапусти SystemUI."
+            }
+        }
+        val lines = ArrayList<String>()
+        lines += "Модуль работает в SystemUI (v${s["v"] ?: "?"}, хуков: ${s["hooks"] ?: "?"})"
+        when {
+            s["miblur"] == "1" || s["winblur"] == "1" ->
+                lines += "⚠ Сейчас в шторке включён системный блюр — свой цвет рисуется только " +
+                    "без блюра. Выключи блюр (например через deviceLevelList)."
+            s["screenshot"] == "1" ->
+                lines += "⚠ Включён скриншот-блюр: свой цвет не виден. Включи «Отключать " +
+                    "скриншот-блюр» и перезапусти SystemUI."
+            else ->
+                lines += "Фон шторки сплошной — цвет применяется сразу."
+        }
+        if (s["forced"] == "1") lines += "Скриншот-блюр отключён модулем."
+        if (s["restart"] == "1") lines += "Нужен перезапуск SystemUI."
+        return lines.joinToString("\n")
+    }
+
+    companion object {
+        private const val P_ENABLED = "enabled"
+        private const val P_COLOR = "color"
+        private const val P_FORCE_SOLID = "force_solid"
+        private const val P_MODAL = "modal"
+
+        private const val DEFAULT_COLOR = 0x80000000.toInt()
+
+        private val SLIDER_NAMES = arrayOf("Непрозрачность", "Красный", "Зелёный", "Синий")
+
+        private val PRESETS = listOf(
+            "Прозрачный" to 0x00000000,
+            "Тень 30%" to 0x4D000000,
+            "Тёмный 60%" to 0x99000000.toInt(),
+            "Чёрный" to 0xFF000000.toInt(),
+            "Белый 25%" to 0x40FFFFFF,
+            "Системный" to Keys.SYSTEM_COLOR,
+        )
     }
 }

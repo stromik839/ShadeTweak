@@ -1,19 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.shadetweak.hyperos">
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Выдаётся один раз через root (pm grant): запись настроек в Settings.Global,
+         откуда их читает хук внутри SystemUI. -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="false"
         android:label="Shade Tweak"
         android:icon="@android:drawable/ic_menu_manage"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:theme="@style/AppTheme">
 
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Керує кольором/прозорістю solid-фону шторки HyperOS, коли блюр вимкнено" />
+            android:value="Свой цвет и прозрачность фона шторки HyperOS, когда блюр выключен" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
