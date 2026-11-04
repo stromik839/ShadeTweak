@@ -254,9 +254,10 @@ class SettingsActivity : Activity() {
         root.addView(resultText, matchWrap(top = dp(8)))
 
         root.addView(caption(
-            "Цвет применяется сразу, без перезапуска. При первом сохранении KernelSU " +
-                "попросит root — он нужен один раз, чтобы выдать приложению право писать " +
-                "настройки (WRITE_SECURE_SETTINGS).\n\n" +
+            "Цвет применяется сразу, без перезапуска. При первом сохранении нужен root " +
+                "(KernelSU: Суперпользователь → Shade Tweak; Magisk покажет запрос). Он нужен " +
+                "один раз, чтобы выдать приложению право писать настройки " +
+                "(WRITE_SECURE_SETTINGS).\n\n" +
                 "Если не работает: LSPosed → Модули → Shade Tweak включён, в области " +
                 "отмечен «Системный интерфейс», затем перезапусти SystemUI. Логи: " +
                 "LSPosed → Логи → «ShadeTweak»."
